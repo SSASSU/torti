@@ -6,4 +6,5 @@
 
 - 요구사항: [docs/REQUIREMENTS.md](docs/REQUIREMENTS.md)
 - 메인 플로우: **음성 입력 → AI 보조 → 음성 출력** (GUI는 보조)
-- 상태: 기획 단계 (v0.2)
+- 구성: **Windows 네이티브** (음성·STT·TTS 로컬) + **Claude CLI** 연동
+- 상태: 기획 단계 (v0.3)
