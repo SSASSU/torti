@@ -31,7 +31,7 @@ def main() -> None:
 
     print("cameras:", list_cameras())
     idx, name = resolve_camera()
-    cam = Camera(idx)
+    cam = Camera(index=idx)
     t = time.perf_counter()
     ok = cam.open()
     print(f"camera open: {name} idx={idx} ok={ok} ({time.perf_counter() - t:.2f}s)")

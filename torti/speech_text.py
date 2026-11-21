@@ -54,6 +54,7 @@ _UNIT_RES = [(re.compile(_NUM + u + r"(?![A-Za-z])"), word) for u, word in _UNIT
 _MARKDOWN = [
     (re.compile(r"`+"), ""), (re.compile(r"\*\*|__"), ""), (re.compile(r"(?m)^\s*#+\s*"), ""),
     (re.compile(r"(?m)^\s*[-*•]\s+"), ""), (re.compile(r"\[([^\]]+)\]\([^)]*\)"), r"\1"),
+    (re.compile(r"(출처|참고|Sources?)\s*:.*$", re.I), ""), (re.compile(r"https?://\S+|www\.\S+"), ""),
     (re.compile(r"[|*_~>]"), " "),
 ]
 _SYMBOLS = [("×", " 곱하기 "), ("±", " 플러스마이너스 "), ("→", ", "), ("≈", " 약 "), ("~", "에서 ")]
@@ -132,3 +133,14 @@ def speakable(text: str) -> str:
     for sym, word in _SYMBOLS:
         text = text.replace(sym, word)
     return re.sub(r"\s{2,}", " ", text).strip()
+
+
+def times_ko(factor: float) -> str:
+    """Zoom factor as spoken Korean: 2.0 -> "두 배", 2.5 -> "두 배 반"."""
+    half = round(factor * 2) / 2
+    whole = int(half)
+    s = f"{_NATIVE_TIMES.get(whole, str(whole))} 배"
+    return s + " 반" if half > whole else s
+
+
+_NATIVE_TIMES = {1: "한", 2: "두", 3: "세", 4: "네"}

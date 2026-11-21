@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import os
 import queue
+import re
 import threading
 import time
 from dataclasses import asdict
@@ -18,28 +19,35 @@ from typing import Callable
 
 from .audio import Recorder, find_device
 from .brief import Brief, analyze, load_cached
-from .camera import Camera, encode_jpeg, jpeg_size, read_image, resolve_camera
+from .camera import Camera, encode_jpeg, jpeg_size, read_image
+from .closeup import Inspector, Zoom, average_still, for_model, needs_close_look
 from .claude_cli import BILLING_ENV_VARS, ClaudeCli, check_cli
 from .config import Settings
 from .history import History
-from .intent import match_command, match_note, needs_image
+from .intent import match_command, match_note, match_zoom, needs_image
 from .paths import data_dir, history_dir, workspace_dir
-from .project import Project, gh_available
+from .project import Project, gh_available, load_state, save_state
 from .prompts import build_system_prompt
-from .sessions import SessionInfo, default_projects_dir, sessions_for
+from .sessions import SessionInfo, default_projects_dir, find_session, recent_exchanges, sessions_for
 from .sounds import Earcons
-from .speech_text import SentenceSplitter, speakable
+from .speech_text import SentenceSplitter, speakable, times_ko
 from .stt import DEFAULT_PROMPT, WhisperStt
 from . import tts_neural
 from .tts import SapiTts
 from .visual import Pointer, TagFilter, wants_pointing
+from .worker import Worker
 
 LOADING, IDLE, LISTENING, TRANSCRIBING, THINKING, SPEAKING = (
     "LOADING", "IDLE", "LISTENING", "TRANSCRIBING", "THINKING", "SPEAKING")
 HOLD_S = 0.4  # held longer than this = push-to-talk; shorter = tap (VAD finds the end)
+RESUME_DAYS = 3  # a project's conversation older than this starts fresh (the briefing carries over)
 NOTICE = "AI 답변은 참고용이에요. 수치는 꼭 계측기나 데이터시트로 확인해 주세요."
-CODE_TOOLS = "Read,Glob,Grep"
+# Always on: read the work folder (code, notes, datasheets) and look things up on the web. Nothing is
+# changed. The model only uses them when a question needs it, and Torti says so out loud first.
+READ_TOOLS = "Read,Glob,Grep,WebSearch,WebFetch"
 EDIT_TOOLS = "Edit,Write"
+TOOL_FILLERS = {"WebSearch": "찾아볼게요.", "WebFetch": "찾아볼게요.", "Read": "파일 확인해 볼게요.",
+                "Glob": "파일 확인해 볼게요.", "Grep": "파일 확인해 볼게요."}
 
 Emit = Callable[[str, dict], None]
 
@@ -66,7 +74,13 @@ class Engine:
         self.camera: Camera | None = None
         self.cli: ClaudeCli | None = None
         self.pointer: Pointer | None = None
+        self.inspector: Inspector | None = None  # close-ups (closeup.py), fast model
+        self.worker: Worker | None = None  # does file edits / builds in the project folder (worker.py)
+        self._say_when_idle: list[str] = []  # worker results that arrive while a turn is running
         self.reference: dict | None = None  # {"path", "jpeg", "size"} shown instead of the camera
+        self.zoom = Zoom()  # what part of the camera frame is shown, sent and pointed at
+        self.last_marks: tuple[float, list[tuple[float, float, float, float]]] | None = None  # full-frame boxes
+        self.last_photo_at = 0.0  # when the camera photo was last sent (short follow-ups get one too)
         self.session: SessionInfo | None = None  # a resumed Claude Code session, if any
         self.sync_lock = threading.Lock()
         self._running = False
@@ -78,6 +92,10 @@ class Engine:
     def set_state(self, state: str) -> None:
         self.state = state
         self.emit("state", {"state": state})
+        if state == IDLE and self._say_when_idle:
+            for text in self._say_when_idle:
+                self.tts.say(text)
+            self._say_when_idle.clear()
 
     @property
     def cwd(self) -> Path:
@@ -116,14 +134,13 @@ class Engine:
         self.log(f"마이크: {self.rec.device_name}")
 
         if open_camera or (open_camera is None and self.s.image != "never"):
-            idx, name = resolve_camera(self.s.camera)
-            cam = Camera(idx)
-            if cam.open():
-                self.camera = cam
-                self.log(f"카메라: {name} (index {idx})")
-            else:
-                self.log(f"카메라 열기 실패: {name} (index {idx}) - 사진 없이 진행")
+            # Keeps trying in the background: a camera plugged in (or replugged) later just works.
+            cam = Camera(self.s.camera, on_change=self.log)
+            self.camera = cam
+            if not cam.open():
+                self.log(f"카메라 아직 없음 ({self.s.camera or '실제 카메라'}) - 연결되면 바로 씁니다")
         self.pointer = Pointer(self.s.pointer_model, cwd=workspace_dir())
+        self.inspector = Inspector(Pointer(self.s.inspect_model, cwd=workspace_dir()), self.s.long_edge)
         self.history = History(history_dir())
         self.log(f"기록: {self.history.dir}")
 
@@ -174,29 +191,53 @@ class Engine:
         self.brief = self.load_brief(force=reanalyze) if project else None
         self.emit("brief", {"brief": asdict(self.brief) if self.brief else None})
         self.apply_voice()
-        self._start_cli()
+        if self.worker:
+            self.worker.close()
+        state = load_state(project.root) if project else {}
+        self.worker = Worker(project, self._work_event, model=self.s.worker_model, commands=self.s.worker_commands,
+                             push=self.s.worker_push,
+                             resume=state.get("worker_session") if state.get("worker_session") and
+                             find_session(project.root, state["worker_session"]) else None) if project else None
+        # Continue where this project's conversation left off (same Claude Code session), unless it's stale.
+        resume = None
+        if project and state.get("voice_session") and time.time() - state.get("updated", 0) < RESUME_DAYS * 86400:
+            resume = find_session(project.root, state["voice_session"])
+        self._start_cli(continue_session=resume)
         self.emit("state", {"state": self.state})  # leave the "analyzing" display
 
-    def _start_cli(self, resume: SessionInfo | None = None, code_tools: bool = False, edits: bool = False) -> None:
-        """(Re)start the conversation process: Torti's own voice session, or a resumed one."""
-        tools, extra = "", []
-        if resume or code_tools:
-            tools = CODE_TOOLS + ("," + EDIT_TOOLS if edits else "")
-            if edits:
-                extra = ["--permission-mode", "acceptEdits"]
-        elif self.project and any((self.project.root / "datasheets").glob("*.pdf")):
-            tools = "Read"  # FR-52: let the CLI read datasheets; read-only
+    def _start_cli(self, resume: SessionInfo | None = None, code_tools: bool = False, edits: bool = False,
+                   continue_session: SessionInfo | None = None) -> None:
+        """(Re)start the conversation process: Torti's own voice session (new, or ``continue_session``
+        from last time in this project), or a Claude Code session the user picked (``resume``)."""
+        tools, extra = READ_TOOLS, []
+        if (resume or code_tools) and edits:
+            tools += "," + EDIT_TOOLS
+            extra = ["--permission-mode", "acceptEdits"]
         if self.cli:
             self.cli.stop()
-        self.cli = ClaudeCli(build_system_prompt(self.brief), model=self.s.model, effort=self.s.effort,
-                             cwd=self.cwd, tools=tools, extra_args=extra)
+        camera = None
+        if self.camera:
+            frame = self.camera.snapshot()
+            camera = (self.camera.name or "웹캠") + (f", {frame.shape[1]}x{frame.shape[0]}" if frame is not None else "")
+        self.cli = ClaudeCli(build_system_prompt(self.brief, camera, worker=self.project is not None),
+                             model=self.s.model, effort=self.s.effort, cwd=self.cwd, tools=tools, extra_args=extra)
         self.session = resume
-        if resume:
-            self.cli.session_id = resume.id
-        self.cli.start(resume=resume.id if resume else None)  # boot now; the first question won't pay for it
+        target = resume or continue_session
+        if target:
+            self.cli.session_id = target.id
+        self.cli.start(resume=target.id if target else None)  # boot now; the first question won't pay for it
         self.last_answer = ""
         self.emit("session", {"id": resume.id if resume else None, "title": resume.title if resume else None,
-                              "tools": tools, "edits": edits})
+                              "tools": tools, "edits": edits, "continued": continue_session is not None,
+                              "history": recent_exchanges(target.path) if target else []})
+        if continue_session:
+            self.log(f"지난 대화 이어서: {continue_session.title} ({continue_session.user_turns}턴, "
+                     f"{continue_session.modified:%m-%d %H:%M})")
+
+    def _remember_session(self) -> None:
+        """Torti's own conversation in this project is continued next time it is opened."""
+        if self.project and self.cli and self.session is None:
+            save_state(self.project.root, voice_session=self.cli.session_id)
 
     def list_sessions(self) -> list[SessionInfo]:
         """Claude Code sessions recorded for the current work folder (voice and typed ones included)."""
@@ -279,6 +320,8 @@ class Engine:
     def new_conversation(self) -> None:
         self._start_cli()
         self.last_answer = ""
+        if self.project:
+            save_state(self.project.root, voice_session=None)
 
     # --------------------------------------------------------------- run loop
     def start(self, hotkeys: bool = True) -> None:
@@ -286,8 +329,9 @@ class Engine:
         if hotkeys:
             import keyboard
 
-            keyboard.on_press_key(self.s.hotkey, lambda _e: self._key_down())
-            keyboard.on_release_key(self.s.hotkey, lambda _e: self._key_up())
+            # suppress: the trigger key belongs to Torti; e.g. F1 must not also open help windows
+            keyboard.on_press_key(self.s.hotkey, lambda _e: self._key_down(), suppress=True)
+            keyboard.on_release_key(self.s.hotkey, lambda _e: self._key_up(), suppress=True)
             self._hooked = True
         self._running = True
         threading.Thread(target=self._dispatch, daemon=True, name="torti-dispatch").start()
@@ -338,6 +382,13 @@ class Engine:
             self.tts.stop()
             self.turn.join(timeout=3)
 
+    def switch_project(self, **kwargs) -> Project | None:
+        """Open another project from the UI. An answer in progress is cut off first: switching used
+        to be refused while Torti was talking, with only a small status-bar note, so it looked broken."""
+        self._interrupt_turn()
+        self.tts.stop()
+        return self.open_project(**kwargs)
+
     def _on_trigger(self, t: float) -> None:
         if self.turn is None or not self.turn.is_alive():
             self._start_turn(self.run_turn, t)
@@ -375,6 +426,10 @@ class Engine:
             self.cli.stop()
         if self.pointer:
             self.pointer.stop()
+        if self.inspector:
+            self.inspector.pointer.stop()
+        if self.worker:
+            self.worker.close()
         if self.project:
             self.sync(announce=False)  # FR-55: push the day's log on exit
         if self.camera:
@@ -403,7 +458,7 @@ class Engine:
                     self.earcons.play("idle")
                 return
             self.earcons.play("accept")
-            frame = self.camera.snapshot() if self.camera else None
+            shot = self.camera.recent_frames() if self.camera else []  # made into a photo only if sent
             tm.update(speech_start=utt.speech_start, speech_end=utt.speech_end, endpoint=utt.endpoint_at)
             turn_id = self.history.next_id()
             wav = self.history.save_wav(turn_id, utt.audio)
@@ -418,7 +473,7 @@ class Engine:
                 self.earcons.play("idle")
                 return
             self.emit("heard", {"text": stt.text, "source": "voice", "stt_ms": round(stt.seconds * 1000)})
-            self._respond(stt.text, frame, tm, turn_id, speak=True)
+            self._respond(stt.text, shot, tm, turn_id, speak=True)
         except Exception as e:  # noqa: BLE001 - never crash the loop (NFR-06)
             self._fail(e)
         finally:
@@ -428,9 +483,9 @@ class Engine:
         now = time.perf_counter()
         tm: dict[str, float | None] = {"trigger": now, "speech_end": now}
         try:
-            frame = self.camera.snapshot() if self.camera else None
+            shot = self.camera.recent_frames() if self.camera else []  # made into a photo only if sent
             self.emit("heard", {"text": text, "source": "text", "stt_ms": None})
-            self._respond(text, frame, tm, self.history.next_id(), speak=speak)
+            self._respond(text, shot, tm, self.history.next_id(), speak=speak)
         except Exception as e:  # noqa: BLE001
             self._fail(e)
         finally:
@@ -442,7 +497,24 @@ class Engine:
         self.earcons.play("error")
         self.tts.say("문제가 생겼어요. 다시 말해 주세요.")
 
-    def _respond(self, text: str, frame, tm: dict, turn_id: int, speak: bool) -> None:
+    def _wants_photo(self, text: str) -> bool:
+        """Auto mode: words about what's in front of the camera, anything while zoomed in (the user is
+        looking at something), and short follow-ups ("봐봐", "어때", "이건?") right after a photo turn."""
+        if self.s.image != "auto":
+            return needs_image(text, self.s.image)
+        follow_up = len(text.strip()) <= 12 and time.monotonic() - self.last_photo_at < 180
+        return needs_image(text) or self.zoom.active or follow_up
+
+    def _no_photo_reason(self, shot: list) -> str:
+        if self.s.image == "never":
+            return "사진 보내기 설정이 '보내지 않기'라서 사진을 받지 못했다. 화면 왼쪽 '사진' 설정을 '자동'으로 바꾸면 보인다."
+        if self.camera is None:
+            return "카메라가 켜져 있지 않다."
+        if not shot:
+            return "카메라가 다시 연결되는 중이라 지금 화면을 받지 못했다. 잠시 뒤 다시 물어보면 된다."
+        return "이번 질문에는 사진이 붙지 않았다. '지금 이거 봐줘'처럼 물으면 사진을 같이 보낸다."
+
+    def _respond(self, text: str, shot: list, tm: dict, turn_id: int, speak: bool) -> None:
         """Shared by voice and text: local commands, photo/reference, pointing, streamed answer."""
         note = match_note(text)
         if note:
@@ -454,6 +526,10 @@ class Engine:
             else:
                 self.tts.say("연결된 작업이 없어서 기록하지 못했어요.")
             return
+        zoom = match_zoom(text)  # before commands: "확대 취소" is a zoom reset, not "cancel"
+        if zoom:
+            self.zoom_command(*zoom, text=text)
+            return
         cmd = match_command(text)
         if cmd:
             self.run_command(cmd, text)
@@ -461,53 +537,64 @@ class Engine:
 
         # What the assistant looks at: a reference image the user put on screen, else the camera.
         jpeg, size, source = None, None, None
+        view_rect = self.zoom.rect()
         if self.reference:
             jpeg, size, source = self.reference["jpeg"], self.reference["size"], Path(self.reference["path"]).name
-        elif frame is not None and needs_image(text, self.s.image):
-            jpeg = encode_jpeg(frame, self.s.long_edge)
+        elif shot and self._wants_photo(text):
+            jpeg = self._photo(shot)
             size, source = jpeg_size(jpeg), "사진"
+        ask = text
+        if jpeg and source == "사진" and self.zoom.active:
+            ask = f"[{times_ko(self.zoom.factor)} 확대한 화면: 책상 일부만 보인다]\n{text}"
+        if not jpeg and needs_image(text, "auto"):  # seems to be about what's in front of the camera
+            ask = (f"[사진 없음: {self._no_photo_reason(shot)} 질문이 눈앞의 작업을 봐야 하는 것이면 "
+                   f"볼 수 없다고만 하지 말고 이유와 방법을 한 문장으로 알려 준다. 사진 없이 답할 수 있으면 그냥 답한다.]\n{text}")
         image_name = None
+        if jpeg and source == "사진":
+            self.last_photo_at = time.monotonic()
         if jpeg and not self.reference:
             image_name = self.project.save_capture(jpeg) if self.project else self.history.save_image(turn_id, jpeg)
         if jpeg and wants_pointing(text) and self.pointer:  # precise model marks the spot in parallel
-            threading.Thread(target=self._point, args=(jpeg, size, text, source), daemon=True).start()
+            threading.Thread(target=self._point, args=(jpeg, size, text, source, view_rect), daemon=True).start()
 
         self.set_state(THINKING)
-        tags = TagFilter()
-        splitter = SentenceSplitter()
-        raw: list[str] = []
-        result = None
+        images = jpeg
+        if source == "사진" and not self.zoom.active and needs_close_look(text):
+            # Small print or fine detail: find the part and send a close-up along with the whole
+            # photo, so the answer needs no second round trip (~1 s instead of ~7 s).
+            look = self._close_look(shot, text, None, turn_id)
+            if look:
+                images = [jpeg, look.jpeg]
+                ask = (f"[사진 두 장: 첫 번째는 책상 전체, 두 번째는 '{look.label}' 부분을 {times_ko(look.factor)} 확대한 것. "
+                       f"글자와 작은 부분은 두 번째 사진으로 본다. 확대 태그는 쓰지 않는다]\n{text}")
+        note = self.worker.status_note() if self.worker else None
+        if note:  # what the worker is doing / just finished, so "작업 어떻게 됐어?" can be answered
+            ask = f"{note}\n{ask}"
         tm["sent"] = time.perf_counter()
-        gen = self.cli.ask(text, jpeg, cancel=self.cancel)
-        try:
-            for kind, val in gen:
-                if self.cancel.is_set():
-                    break
-                if kind == "text":
-                    clean = tags.feed(val)
-                    if not clean:
-                        continue
-                    tm.setdefault("first_token", time.perf_counter())
-                    raw.append(clean)
-                    self.emit("delta", {"text": clean})
-                    if speak:
-                        for sentence in splitter.feed(clean):
-                            self._speak(sentence, tm)
-                elif kind == "result":
-                    result = val
-        finally:
-            gen.close()
-        answer = "".join(raw).strip()
+        answer, result, tags = self._stream(ask, images, tm, speak)
+        if tags.work_order and not self.cancel.is_set():
+            self._hand_off(tags.work_order)
+        if not self.cancel.is_set() and tags.zoom_target is not None and result and result.ok:
+            # The model still wants a closer look (<확대 대상="..."/>): close-up of that target, then
+            # ask again. The user's own view and zoom stay as they were.
+            target = tags.zoom_target or text
+            jpeg, look = None, None
+            if source == "사진" and self.camera:
+                if speak:
+                    self._speak("확대해서 볼게요.", tm)
+                look = self._close_look(self.camera.recent_frames(), text, target, turn_id)
+            if look:
+                jpeg = look.jpeg
+                ask = (f"[{look.label}을(를) {times_ko(look.factor)} 확대한 사진이다. 이 사진으로 답하고 "
+                       f"확대 태그는 다시 쓰지 않는다]\n{text}")
+            else:
+                ask = (f"[확대 실패: '{target}'을(를) 확대하지 못했다. 앞 사진에서 보이는 만큼만 답하고, 필요하면 "
+                       f"그 부분을 카메라 가운데로 가까이 옮겨 달라고 한마디 한다. 확대 태그는 다시 쓰지 않는다]\n{text}")
+            more, result, _ = self._stream(ask, jpeg, tm, speak)
+            answer = f"{answer} {more}".strip()
         if self.cancel.is_set():
             self._record(turn_id, text, image_name, answer, tm, result, interrupted=True)
             return
-        rest = tags.flush()
-        if rest:
-            answer = (answer + rest).strip()
-            self.emit("delta", {"text": rest})
-        if speak:
-            for sentence in splitter.feed(rest) + splitter.flush():
-                self._speak(sentence, tm)
 
         if result is None or not result.ok:
             err = result.error if result else "응답 없음"
@@ -529,13 +616,149 @@ class Engine:
         if finished:
             self.earcons.play("idle")
 
-    def _point(self, jpeg: bytes, size: tuple[int, int], question: str, source: str) -> None:
+    def _stream(self, ask: str, jpeg: bytes | None, tm: dict, speak: bool) -> tuple[str, object, TagFilter]:
+        """Ask the conversation model; show and speak the answer sentence by sentence as it streams."""
+        tags, splitter, raw, result = TagFilter(), SentenceSplitter(), [], None
+        said_filler = False
+        gen = self.cli.ask(ask, jpeg, cancel=self.cancel)
+        try:
+            for kind, val in gen:
+                if self.cancel.is_set():
+                    break
+                if kind == "tool":  # searching or reading takes seconds: say so instead of going quiet
+                    self.log(f"도구: {val}")
+                    self.emit("tool", {"name": val})
+                    if speak and not said_filler and val in TOOL_FILLERS:
+                        for sentence in splitter.flush():  # whatever was said before the tool call
+                            self._speak(sentence, tm)
+                        self._speak(TOOL_FILLERS[val], tm)
+                        said_filler = True
+                elif kind == "text":
+                    clean = tags.feed(val)
+                    if not clean:
+                        continue
+                    tm.setdefault("first_token", time.perf_counter())
+                    raw.append(clean)
+                    self.emit("delta", {"text": clean})
+                    if speak:
+                        for sentence in splitter.feed(clean):
+                            self._speak(sentence, tm)
+                elif kind == "result":
+                    result = val
+        finally:
+            gen.close()
+        if not self.cancel.is_set():
+            rest = tags.flush()
+            if rest:
+                raw.append(rest)
+                self.emit("delta", {"text": rest})
+            if speak:
+                for sentence in splitter.feed(rest) + splitter.flush():
+                    self._speak(sentence, tm)
+        return "".join(raw).strip(), result, tags
+
+    # ------------------------------------------------------------------ zoom
+    def _photo(self, frames: list) -> bytes:
+        """JPEG of what the view shows, for the model: still frames averaged (less grain on small
+        print) and, when zoomed, the crop at native pixels enlarged so small text is readable."""
+        img, n = average_still([self.zoom.crop(f) for f in frames])
+        if self.zoom.active:
+            self.log(f"사진: {self.zoom.factor:.1f}배 확대, {img.shape[1]}x{img.shape[0]} 원본 화소, {n}장 평균")
+            return for_model(img, self.s.long_edge)
+        return encode_jpeg(img, self.s.long_edge)
+
+    def zoom_changed(self, why: str) -> None:
+        self.log(f"확대 {self.zoom.factor:.1f}배 ({why})" if self.zoom.active else f"전체 화면 ({why})")
+        self.emit("zoom", {"factor": round(self.zoom.factor, 2), "rect": self.zoom.rect()})
+
+    def _zoom_to_boxes(self, boxes: list[tuple[float, float, float, float]], why: str) -> None:
+        self.zoom.to_box((min(b[0] for b in boxes), min(b[1] for b in boxes),
+                          max(b[2] for b in boxes), max(b[3] for b in boxes)))
+        self.zoom_changed(why)
+
+    def _locate_zoom(self, target: str) -> bool:
+        """Find ``target`` on the whole frame with the precise model and zoom the view onto it."""
+        box = self._find(target)
+        if box:
+            self.zoom.to_box(box)
+            self.zoom_changed(target)
+        return box is not None
+
+    def _find(self, target: str) -> tuple[float, float, float, float] | None:
+        """Box around ``target`` on the whole camera frame (fractions)."""
+        full = self.camera.snapshot() if self.camera else None
+        if full is None or not self.inspector:
+            return None
+        try:
+            box, secs, label = self.inspector.find(full, f"{target} 위치")
+        except Exception as e:  # noqa: BLE001
+            self.log(f"확대할 곳 찾기 실패: {e}")
+            return None
+        self.log(f"확대할 곳 '{target}' ({secs:.1f}s): {label or '찾지 못함'}")
+        return box
+
+    def _close_look(self, frames: list, question: str, target: str | None, turn_id: int):
+        """Close-up for the model (closeup.Inspector); shown briefly so the user sees what was looked at."""
+        if not frames or not self.inspector:
+            return None
+        try:
+            look = self.inspector.look(frames, question, target)
+        except Exception as e:  # noqa: BLE001 - a close-up is a bonus; answer from the whole photo
+            self.log(f"확대 실패: {e}")
+            return None
+        if not look:
+            self.log(f"확대할 곳 못 찾음: {target or question!r}")
+            return None
+        self.log(f"확대해서 봄: '{look.label}' {look.factor:.1f}배, 찾기 {look.seconds:.1f}s, {look.frames}장 평균")
+        self.emit("peek", {"jpeg": look.jpeg, "label": look.label, "factor": round(look.factor, 1)})
+        if self.project:
+            self.project.save_capture(look.jpeg)
+        else:
+            self.history.save_image(turn_id, look.jpeg, "-close")
+        return look
+
+    def zoom_command(self, kind: str, target: str | None, times: float | None, text: str) -> None:
+        """Spoken or typed zoom request: "확대해", "보드 확대해", "세 배 확대", "거기 확대", "축소", "원래대로"."""
+        self.log(f"음성 명령: 확대 {kind} {target or ''} ({text!r})")
+        self.emit("command", {"cmd": "zoom", "text": text})
+        if not self.camera:
+            self.tts.say("카메라가 없어서 확대할 수 없어요.")
+        elif self.reference:
+            self.tts.say("자료를 닫으면 카메라 화면을 확대할 수 있어요.")
+        elif kind == "reset":
+            self.zoom.reset()
+            self.zoom_changed("원래대로")
+            self.tts.say("전체 화면이에요.")
+        elif kind == "out":
+            self.zoom.zoom_at(self.zoom.factor / 2)
+            self.zoom_changed("축소")
+            self.tts.say(f"{times_ko(self.zoom.factor)}예요." if self.zoom.active else "전체 화면이에요.")
+        elif target:
+            self.tts.say("찾아서 확대할게요.")
+            if self._locate_zoom(target):
+                self.tts.say(f"{times_ko(self.zoom.factor)}로 확대했어요.")
+            else:
+                self.tts.say("화면에서 찾지 못했어요. 카메라 가운데로 옮겨 주세요.")
+        elif (self.last_marks and time.monotonic() - self.last_marks[0] < 180 and not times
+              and re.search(r"거기|여기|표시", text)):
+            self._zoom_to_boxes(self.last_marks[1], "표시한 곳")
+            self.tts.say("표시한 곳을 확대했어요.")
+        else:
+            self.zoom.zoom_at(times or (self.zoom.factor * 2 if self.zoom.active else 2.0))
+            self.zoom_changed("확대")
+            self.tts.say(f"{times_ko(self.zoom.factor)}예요.")
+
+    def _point(self, jpeg: bytes, size: tuple[int, int], question: str, source: str,
+               view_rect: tuple[float, float, float, float] | None = None) -> None:
         try:
             marks, secs = self.pointer.locate(jpeg, size, question)
         except Exception as e:  # noqa: BLE001 - pointing is a bonus; the spoken answer stands alone
             self.log(f"위치 표시 실패: {e}")
             return
         self.log(f"위치 표시 {len(marks)}개 ({secs:.1f}s): {', '.join(m.label for m in marks) or '찾지 못함'}")
+        if marks and source == "사진" and view_rect:  # remembered on the full frame for "거기 확대해"
+            self.last_marks = (time.monotonic(),
+                               [self.zoom.view_to_full(tuple(v / 1000 for v in m.box), view_rect) for m in marks])
         if marks:
             self.earcons.play("visual")
             self.emit("visual", {"jpeg": jpeg, "marks": [asdict(m) for m in marks], "question": question,
@@ -550,6 +773,37 @@ class Engine:
             self.set_state(SPEAKING)
         self.emit("say", {"text": text})
         self.tts.say(text)
+
+    # ---------------------------------------------------------------- worker
+    def _hand_off(self, order: str) -> None:
+        """The voice model wrote <작업 지시="..."/>: give it to the worker."""
+        if not self.worker:
+            self.tts.say("작업 폴더가 열려 있지 않아서 맡길 수 없어요. 먼저 작업을 열어 주세요.")
+        else:  # started, or queued behind the running task (the voice model already said so)
+            self.log(f"작업자에게 맡김 ({self.worker.start(order)}): {order}")
+
+    def _work_event(self, kind: str, data: dict) -> None:
+        """Worker progress goes to the screen; the result is also said out loud (after the current turn)."""
+        self.emit(kind, data)
+        phase = data.get("phase")
+        if phase == "step":
+            self.log(f"작업 {data['n']}: {data['text']}")
+        elif phase == "denied":
+            self.log(f"작업자 명령 거부됨 (허용 목록 밖): {data['text']}")
+        elif phase == "done":
+            if self.project and self.worker and self.worker.session_id:
+                save_state(self.project.root, worker_session=self.worker.session_id,
+                           last_task={"summary": data["summary"], "commit": data["commit"], "files": data["files"]})
+            self.log(f"작업 끝 ({data['seconds']}초, 커밋 {data['commit'] or '없음'}, "
+                     f"{'GitHub에 올림' if data['pushed'] else '올리지 않음'}): {data['summary'][:200]}")
+            sentences = re.split(r"(?<=[.!?])\s+", speakable(data["summary"]))
+            text = ("작업을 멈췄어요. " if data["stopped"] else "작업 끝났어요. ") + " ".join(sentences[:3])
+            if data["pushed"]:
+                text += " GitHub에도 올렸어요."
+            if self.state == IDLE:
+                self.tts.say(text)
+            else:
+                self._say_when_idle.append(text)
 
     def run_command(self, cmd: str, text: str) -> None:
         self.log(f"음성 명령: {cmd} ({text!r})")
@@ -570,6 +824,10 @@ class Engine:
         elif cmd == "sync":
             self.tts.say("깃허브에 올릴게요.")
             threading.Thread(target=self.sync, daemon=True).start()
+        elif cmd == "work_stop":
+            self.tts.say("작업 멈출게요." if self.worker and self.worker.stop() else "진행 중인 작업이 없어요.")
+        elif cmd == "work_undo":
+            self.tts.say(self.worker.undo().message if self.worker else "되돌릴 작업이 없어요.")
         elif cmd == "reanalyze":
             self.tts.say("작업을 다시 살펴볼게요.")
             self.reanalyze()
@@ -595,3 +853,4 @@ class Engine:
         }
         self.history.append(record)
         self.emit("turn", record)
+        self._remember_session()

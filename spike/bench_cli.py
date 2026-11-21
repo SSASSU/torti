@@ -68,7 +68,7 @@ def main() -> None:
         sys.exit(1)
 
     OUT.mkdir(parents=True, exist_ok=True)
-    cam = Camera(args.camera)
+    cam = Camera(index=args.camera)
     image = None
     if cam.open():
         time.sleep(1.0)  # let auto exposure settle

@@ -30,7 +30,7 @@ py -3.12 -m venv .venv-tts
 .venv\Scripts\python -m torti --mic "Wave:3"          # 옵션은 %LOCALAPPDATA%\Torti\settings.json에 저장됨
 ```
 
-- 말하기: F9·페달·화면 버튼 (탭하면 자동 종료, 누른 채 말하면 뗄 때 종료). 말하기 어려우면 입력창에 입력
+- 말하기: F1(왼손)·페달·화면 버튼 (탭하면 자동 종료, 누른 채 말하면 뗄 때 종료). 말하기 어려우면 입력창에 입력
 - 작업: 새 작업 / GitHub에서 이어서 / 기존 폴더 열기. 열면 저장소를 분석해 분야·진행 상황·말투를 맞춤
 - 자료 띄우기: 회로도·도면 이미지를 띄우면 질문과 위치 표시가 그 자료 기준
 - 위치 질문("D3 자리 어디야?")은 화면에 강조 표시
@@ -43,7 +43,7 @@ py -3.12 -m venv .venv-tts
 준비물: Python 3.12, NVIDIA GPU(선택), [Claude CLI](https://code.claude.com) 구독 로그인.
 
 ```powershell
-# 음성 루프: F9(또는 F9로 매핑한 페달)를 누르고 말하기
+# 음성 루프: F1(또는 F1로 매핑한 페달)을 누르고 말하기
 .venv\Scripts\python spike\m0_console.py --mic "Wave:3"
 
 # 새 작업 시작 (미리 만든 빈 GitHub 저장소에 연결)

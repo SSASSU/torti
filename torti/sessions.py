@@ -94,3 +94,48 @@ def sessions_for(cwd: Path, projects_dir: Path | None = None, limit: int = 30) -
             if len(out) >= limit:
                 break
     return out
+
+
+def find_session(cwd: Path, session_id: str, projects_dir: Path | None = None) -> SessionInfo | None:
+    """The recorded session ``session_id`` of folder ``cwd``, if it still exists."""
+    path = (projects_dir or default_projects_dir()) / slug(cwd) / f"{session_id}.jsonl"
+    return read_session(path, cwd) if path.exists() else None
+
+
+_TAGS = re.compile(r"<(표시|확대|작업)\b[^>]*/?>")
+_NOTE = re.compile(r"^\[[^\]]*\]\s*", re.S)  # Torti's own "[사진 두 장: ...]" notes before a question
+
+
+def recent_exchanges(path: Path, n: int = 6) -> list[tuple[str, str]]:
+    """Last ``n`` (role, text) pairs of a session, "me"/"torti", for showing where it left off."""
+    out: list[tuple[str, str]] = []
+    try:
+        with path.open(encoding="utf-8") as f:
+            for line in f:
+                try:
+                    rec = json.loads(line)
+                except ValueError:
+                    continue
+                if rec.get("isSidechain") or rec.get("type") not in ("user", "assistant"):
+                    continue
+                msg = rec.get("message") or {}
+                if rec["type"] == "user":
+                    text = _first_text(msg).strip()
+                    if not text or text.startswith("<"):
+                        continue
+                    while _NOTE.match(text):
+                        text = _NOTE.sub("", text, count=1).strip()
+                    if text:
+                        out.append(("me", text))
+                else:
+                    parts = [b.get("text", "") for b in msg.get("content") or [] if isinstance(b, dict) and b.get("type") == "text"]
+                    text = _TAGS.sub("", " ".join(parts)).strip()
+                    if not text:
+                        continue
+                    if out and out[-1][0] == "torti":  # text after a tool call: same answer
+                        out[-1] = ("torti", out[-1][1] + " " + text)
+                    else:
+                        out.append(("torti", text))
+    except OSError:
+        return []
+    return out[-n:]

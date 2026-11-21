@@ -18,8 +18,8 @@ class History:
         self._n += 1
         return self._n
 
-    def save_image(self, turn_id: int, jpeg: bytes) -> str:
-        path = self.dir / f"turn-{turn_id:03d}.jpg"
+    def save_image(self, turn_id: int, jpeg: bytes, suffix: str = "") -> str:
+        path = self.dir / f"turn-{turn_id:03d}{suffix}.jpg"
         path.write_bytes(jpeg)
         return path.name
 

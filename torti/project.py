@@ -49,7 +49,8 @@ NOTES_MD = """\
 ## 메모
 """
 
-GITIGNORE_LINES = ("captures/", ".torti/")  # photos stay local; .torti/ is Torti's derived cache
+GITIGNORE_LINES = ("captures/", ".torti/", "__pycache__/", "*.pyc", ".pio/")  # photos stay local; .torti/ is
+# Torti's cache and state; the rest are build leftovers the worker's commands may create
 
 
 @dataclass
@@ -274,3 +275,24 @@ class Project:
         """VC-07 "기록해 둬: ..." appends to NOTES.md under a dated bullet."""
         with (self.root / "NOTES.md").open("a", encoding="utf-8") as f:
             f.write(f"\n- {time.strftime('%m-%d %H:%M')} {text}\n")
+
+
+def _state_path(root: Path) -> Path:
+    return root / ".torti" / "state.json"
+
+
+def load_state(root: Path) -> dict:
+    """Per-project memory kept out of git (.torti/): sessions to continue, last worker task."""
+    try:
+        return json.loads(_state_path(root).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+
+
+def save_state(root: Path, **values) -> None:
+    data = load_state(root)
+    data.update(values)
+    data["updated"] = time.time()
+    path = _state_path(root)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")

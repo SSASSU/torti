@@ -89,13 +89,22 @@ class ClaudeCli:
         tools: str = "",
         exe: str = "claude",
         extra_args: list[str] | None = None,
+        allowed: list[str] | None = None,
+        append_system: bool = False,
+        env: dict[str, str] | None = None,
     ) -> None:
+        """``tools``: tools the model has; ``allowed``: pre-approved ones (default: all of ``tools``),
+        e.g. ``Bash(pio run:*)`` patterns - anything else that would ask is denied. ``append_system``:
+        add to Claude Code's own system prompt instead of replacing it (for the coding worker)."""
         self.exe = find_cli(exe) or exe
         self.system_prompt = system_prompt
         self.model = model
         self.effort = effort
         self.cwd = str(cwd) if cwd else None
         self.tools = tools
+        self.allowed = allowed
+        self.append_system = append_system
+        self.env = dict(env or {})  # extra environment for the CLI and the commands it runs
         self.extra_args = list(extra_args or [])
         self.session_id: str | None = None
         self.model_resolved: str | None = None
@@ -121,9 +130,11 @@ class ClaudeCli:
             "--strict-mcp-config",  # no MCP servers: faster start, nothing outside the app's scope
             "--disable-slash-commands",
             "--permission-prompts", "none",  # unattended: anything that would prompt is denied
-            "--system-prompt", self.system_prompt,
+            "--append-system-prompt" if self.append_system else "--system-prompt", self.system_prompt,
         ]
-        if self.tools:
+        if self.allowed:
+            cmd += ["--allowedTools", *self.allowed]
+        elif self.tools:
             cmd += ["--allowedTools", self.tools]
         if self.effort:
             cmd += ["--effort", self.effort]
@@ -138,6 +149,7 @@ class ClaudeCli:
         if self.alive():
             return
         env, self.removed_env = cli_env()
+        env.update(self.env)
         if self.cwd:
             Path(self.cwd).mkdir(parents=True, exist_ok=True)
         self._events = queue.Queue()
@@ -196,7 +208,7 @@ class ClaudeCli:
         return "\n".join(self._stderr_tail)
 
     # ------------------------------------------------------------------ turns
-    def ask(self, text: str, image_jpeg: bytes | None = None, timeout: float = 120.0,
+    def ask(self, text: str, image_jpeg: bytes | list[bytes] | None = None, timeout: float = 120.0,
             cancel: threading.Event | None = None) -> Iterator[tuple[str, object]]:
         """Send one user turn. Yields ``("text", delta)`` while streaming, then ``("result", TurnResult)``.
 
@@ -209,10 +221,11 @@ class ClaudeCli:
             self.start(resume=self.session_id)
 
         content: list[dict] = []
-        if image_jpeg:
+        images = image_jpeg if isinstance(image_jpeg, list) else [image_jpeg] if image_jpeg else []
+        for jpeg in images:  # several: e.g. the whole photo and a close-up of the part asked about
             content.append({"type": "image", "source": {
                 "type": "base64", "media_type": "image/jpeg",
-                "data": base64.b64encode(image_jpeg).decode("ascii")}})
+                "data": base64.b64encode(jpeg).decode("ascii")}})
         content.append({"type": "text", "text": text})
         if not self._send({"type": "user", "message": {"role": "user", "content": content}}):
             yield "result", TurnResult(ok=False, error="CLI 프로세스에 질문을 보내지 못했습니다")
@@ -241,9 +254,26 @@ class ClaudeCli:
                 elif kind == "stream_event":
                     e = ev.get("event") or {}
                     delta = e.get("delta") or {}
+                    block = e.get("content_block") or {}
                     if e.get("type") == "content_block_delta" and delta.get("type") == "text_delta":
                         parts.append(delta.get("text", ""))
                         yield "text", delta.get("text", "")
+                    elif e.get("type") == "content_block_start" and block.get("type") in ("tool_use", "server_tool_use"):
+                        yield "tool", block.get("name", "")
+                    elif e.get("type") == "message_start" and parts and not parts[-1].endswith((" ", "\n")):
+                        parts.append(" ")  # text after a tool call continues as a new sentence
+                        yield "text", " "
+                elif kind == "assistant":  # complete message: tool calls with their full input
+                    for block in (ev.get("message") or {}).get("content") or []:
+                        if block.get("type") == "tool_use":
+                            yield "tool_call", {"name": block.get("name", ""), "input": block.get("input") or {}}
+                elif kind == "user":  # tool results (denied commands, errors)
+                    for block in (ev.get("message") or {}).get("content") or []:
+                        if isinstance(block, dict) and block.get("type") == "tool_result":
+                            body = block.get("content")
+                            if isinstance(body, list):
+                                body = " ".join(b.get("text", "") for b in body if isinstance(b, dict))
+                            yield "tool_result", {"is_error": bool(block.get("is_error")), "text": str(body or "")[:500]}
                 elif kind == "rate_limit_event":
                     self.last_rate_limit = ev.get("rate_limit_info")
                 elif kind == "result":

@@ -74,3 +74,11 @@ def test_needs_image():
     assert not needs_image("인두 온도 몇 도로 해야 돼?")
     assert not needs_image("플럭스는 왜 써?")
     assert needs_image("플럭스는 왜 써?", "always")
+
+
+def test_speakable_drops_links_and_sources():
+    from torti.speech_text import speakable
+
+    assert speakable("Gen-5X는 격투 게임용 보드예요. 출처: [Brook](https://brook.com/x), [PDF](https://a.b/c.pdf)") == \
+        "Gen-5X는 격투 게임용 보드예요."
+    assert speakable("자세한 건 https://example.com/page 에 있어요") == "자세한 건 에 있어요"

@@ -11,13 +11,13 @@ from .paths import data_dir
 
 @dataclass
 class Settings:
-    hotkey: str = "f9"
+    hotkey: str = "f1"  # left hand; the key is swallowed so F1 help windows do not open
     mic: str | None = None
     speaker: str | None = None
     camera: str | None = None
     image: str = "auto"  # auto | always | never
     long_edge: int = 1280
-    model: str = "haiku"
+    model: str = "sonnet"
     effort: str = "low"
     stt_model: str = "large-v3-turbo"
     beam: int = 1
@@ -28,6 +28,10 @@ class Settings:
     tts_engine: str = "chatterbox"  # chatterbox (natural male voice, .venv-tts) | sapi (Windows Heami)
     brief_model: str = "sonnet"
     pointer_model: str = "sonnet"  # marks locations on photos; measured 4/4 hits, ~2s
+    worker_model: str = "sonnet"  # the worker session that edits files and runs builds (worker.py)
+    worker_commands: list[str] | None = None  # command prefixes it may run; None: worker.DEFAULT_COMMANDS
+    worker_push: bool = True  # push its commits when the project has a GitHub remote
+    inspect_model: str = "sonnet"  # finds the part to close up for reading questions (~1 s; Haiku missed it)
     push_photos: bool = False
     last_project: str | None = None  # project name or folder path
     text_speaks: bool = False  # answers to typed questions are also spoken
@@ -56,14 +60,14 @@ class Settings:
 
 def build_parser(description: str = "Torti") -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser(description=description)
-    ap.add_argument("--hotkey", help="트리거 키 (페달을 이 키로 매핑). 기본 f9")
+    ap.add_argument("--hotkey", help="트리거 키 (페달을 이 키로 매핑). 기본 f1 (왼손)")
     ap.add_argument("--mic", help="마이크 이름 일부, 예: 'Wave:3' (기본: 시스템 기본)")
     ap.add_argument("--speaker", help="출력 장치 이름 일부 (기본: 시스템 기본)")
     ap.add_argument("--camera", help="카메라 이름 일부 (기본: 가상 카메라가 아닌 첫 장치)")
     ap.add_argument("--image", choices=("auto", "always", "never"),
                     help="사진 전송: auto=질문에 '이거/방금/보여' 등이 있을 때만")
     ap.add_argument("--long-edge", type=int, help="전송 이미지 긴 변 픽셀 (기본 1280)")
-    ap.add_argument("--model", help="Claude CLI 모델 haiku/sonnet/opus (기본 haiku)")
+    ap.add_argument("--model", help="Claude CLI 모델 haiku/sonnet/opus (기본 sonnet)")
     ap.add_argument("--effort")
     ap.add_argument("--stt-model")
     ap.add_argument("--beam", type=int)

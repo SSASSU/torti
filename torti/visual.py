@@ -29,7 +29,8 @@ POINTER_SYSTEM = """\
 - 사진에서 대상을 확실히 찾을 수 없으면 <없음/>만 쓴다."""
 
 # Questions that ask where something is (Korean); photos are only pointed at for these.
-_WHERE = re.compile(r"어디|어느 ?쪽|어느 ?자리|자리|위치|짚어|표시|가리켜|찾아|몇 번 핀|핀 위치")
+# "찾아" only as a request to find a spot ("D3 찾아줘"), not "인터넷에 찾아봐야지".
+_WHERE = re.compile(r"어디|어느 ?쪽|어느 ?자리|자리|위치|짚어|표시해|가리켜|찾아 ?(줘|줄래|봐 ?줘)|몇 번 핀|핀 위치")
 
 
 def wants_pointing(text: str) -> bool:
@@ -43,6 +44,8 @@ POINTING_RULES = """\
   말로는 "화면에 표시한 곳"처럼 짧게만 언급하고 좌표는 말하지 않는다. 위치를 확신할 수 없으면 태그를 붙이지 않는다."""
 
 _TAG = re.compile(r"<표시\b([^>]*)/?>")
+_ZOOM_TAG = re.compile(r"<확대\b([^>]*)/?>")  # the voice model asks for a closer look
+_WORK_TAG = re.compile(r"<작업\b([^>]*)/?>")  # the voice model hands work to the worker (worker.py)
 _ATTR = re.compile(r'(\w+)\s*=\s*"([^"]*)"')
 
 
@@ -120,12 +123,34 @@ class Pointer:
 
 
 class TagFilter:
-    """Streaming filter: passes speakable text through, holds back anything that may be a tag."""
+    """Streaming filter: passes speakable text through, holds back anything that may be a tag.
+    Collects ``<표시 .../>`` marks and a ``<확대 대상="..."/>`` request (``zoom_target``)."""
 
-    def __init__(self, max_hold: int = 400) -> None:
+    def __init__(self, max_hold: int = 2000) -> None:  # a work order can be a long paragraph
         self._buf = ""
         self.marks: list[Mark] = []
+        self.zoom_target: str | None = None
+        self.work_order: str | None = None
         self.max_hold = max_hold
+
+    def _take(self, chunk: str) -> bool:
+        """Consume a complete tag; False if ``chunk`` is ordinary text."""
+        m = _TAG.fullmatch(chunk.strip())
+        if m:
+            mark = parse_tag(m.group(1))
+            if mark:
+                self.marks.append(mark)
+            return True
+        m = _WORK_TAG.fullmatch(chunk.strip())
+        if m:
+            order = dict(_ATTR.findall(m.group(1))).get("지시", "").strip()
+            self.work_order = order or self.work_order
+            return True
+        m = _ZOOM_TAG.fullmatch(chunk.strip())
+        if m:
+            self.zoom_target = dict(_ATTR.findall(m.group(1))).get("대상", "").strip()
+            return True
+        return False
 
     def feed(self, text: str) -> str:
         self._buf += text
@@ -145,21 +170,14 @@ class TagFilter:
                     self._buf = ""
                 break
             chunk, self._buf = self._buf[:gt + 1], self._buf[gt + 1:]
-            m = _TAG.fullmatch(chunk.strip())
-            if m:
-                mark = parse_tag(m.group(1))
-                if mark:
-                    self.marks.append(mark)
-            else:
+            if not self._take(chunk):
                 out.append(chunk)
         return "".join(out)
 
     def flush(self) -> str:
         rest, self._buf = self._buf, ""
-        m = _TAG.search(rest)
-        if m:
-            mark = parse_tag(m.group(1))
-            if mark:
-                self.marks.append(mark)
-            rest = _TAG.sub("", rest)
-        return rest
+        for regex in (_TAG, _ZOOM_TAG, _WORK_TAG):
+            for m in regex.finditer(rest):
+                self._take(m.group(0))
+            rest = regex.sub("", rest)
+        return re.sub(r"<(표시|확대|작업)\b[^>]*$", "", rest)  # an unfinished tag is dropped, never spoken

@@ -58,7 +58,8 @@ def test_clone_existing_claude_repo_keeps_its_files(tmp_path):
     proj, res = Project.clone(str(src), base=tmp_path / "pc")
     assert res.ok, res.message
     assert (proj.root / "CLAUDE.md").read_text(encoding="utf-8") == "# 기존 프로젝트 지침\n"
-    assert (proj.root / ".gitignore").read_text(encoding="utf-8") == "*.log\ncaptures/\n.torti/\n"
+    assert (proj.root / ".gitignore").read_text(encoding="utf-8") == \
+        "*.log\ncaptures/\n.torti/\n__pycache__/\n*.pyc\n.pio/\n"
     assert (proj.root / "log").is_dir()
 
 
