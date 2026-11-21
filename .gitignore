@@ -1,0 +1,11 @@
+.venv/
+.venv-*/
+.cache/
+__pycache__/
+*.pyc
+.env
+*.pem
+*token*.txt
+
+# runtime data: captures, logs, CLI workspace
+data/
