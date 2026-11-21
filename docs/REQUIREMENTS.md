@@ -102,7 +102,7 @@
 |---|---|---|
 | FR-20 | 한국어 음성 → 텍스트 변환 | P0 |
 | FR-21 | 마이크 장치 선택 | P0 |
-| FR-22 | STT는 PC 로컬 실행(faster-whisper). 모델 크기 선택(small/medium/large-v3), GPU(CUDA) 있으면 자동 사용 | P0 |
+| FR-22 | STT는 PC 로컬 실행(faster-whisper). 모델 크기 선택(small/medium/large-v3-turbo/large-v3), GPU(CUDA) 있으면 자동 사용. **기본값: large-v3-turbo, GPU, float16** | P0 |
 | FR-23 | 인식된 텍스트를 GUI에 표시 | P0 |
 | FR-24 | VAD(음성 구간 감지)로 발화 종료 자동 판단, 무음 임계값 설정 가능 | P0 |
 | FR-25 | 노이즈 억제 (흡연기 팬 등 정상 소음 제거) | P1 |
@@ -242,7 +242,8 @@
 | 전역 단축키 | 일부 라이브러리는 관리자 권한 필요 가능 | M0에서 검증 |
 | 한국어 호출어 | 엔진에 따라 한국어 커스텀 호출어 품질/지원이 다름 | M0에서 비교. 안 되면 영어 호출어("Hey Torti")로 대체 |
 | 호출어 오인식 | 작업 소음·대화로 잘못 깨어남 | 감도 조절, "취소" 명령, 일시정지(FR-04b/c) |
-| 로컬 STT 성능 | GPU 없으면 faster-whisper 지연 증가 | 작은 모델(small) 사용, int8 양자화 |
+| 로컬 STT 성능 | RTX 4070 SUPER 기준 짧은 발화는 빠를 것으로 예상. GPU 없는 환경에선 지연 증가 | M0에서 실측. CPU 폴백 시 small + int8 |
+| CUDA 런타임 | faster-whisper(CTranslate2)는 CUDA 12 / cuDNN 9 라이브러리 필요 | pip용 NVIDIA 런타임 패키지 동봉 또는 설치 안내 |
 | CLI 지연 | CLI 기동·도구 호출(이미지 읽기) 오버헤드로 API 직접 호출보다 느릴 수 있음 | M0에서 측정, 상주 프로세스(FR-30b), 빠른 모델 |
 | CLI 사용량 한도 | 구독 플랜 사용량 한도에 걸리면 응답 불가 | 한도 오류 시 음성 안내 |
 | CLI 출력 형식 변경 | CLI 업데이트로 JSON 출력 형식이 바뀔 수 있음 | 파싱 계층 분리, 테스트된 CLI 버전 기록 |
@@ -257,5 +258,5 @@
 | 카메라 | Elgato 웹캠 (모델 미정) | UVC 장치로 OpenCV 캡처. 오버헤드 거치 권장 |
 | 마이크 | Elgato 마이크 (모델 미정) | 일반 Windows 입력 장치로 녹음. 책상용 마이크라 흡연기 팬 소음 유입 가능 → 노이즈 게이트/억제 필요 여부 M0에서 확인 |
 | 페달 | 미정 | |
-| GPU | 미정 | 로컬 STT 모델 크기 결정에 필요 |
+| GPU | **NVIDIA RTX 4070 SUPER (12GB VRAM)** | 로컬 STT를 GPU로 실행. large-v3-turbo / large-v3를 여유 있게 돌릴 수 있음 |
 | Claude CLI | 사용 예정 | Windows 네이티브 설치, 로그인 필요 |
